@@ -3,38 +3,23 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from PyQt5.QtCore import QObject, QRunnable, QThreadPool, QTimer, pyqtSignal, pyqtSlot, Qt
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
-    QApplication,
-    QDialog,
-    QFrame,
-    QHBoxLayout,
-    QHeaderView,
-    QLabel,
-    QMainWindow,
-    QTableWidget,
-    QTableWidgetItem,
-    QVBoxLayout,
-    QWidget,
-    QAction,
-    QComboBox,
+    QApplication, QDialog, QFrame, QHBoxLayout, QHeaderView, QLabel,
+    QMainWindow, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QAction, QComboBox
 )
 
-# CONFIGURATION
 TARGET_IP = "8.8.8.8"
 CSV_FILE = "ping_log.csv"
-INTERVAL_MS = 1000  # 1 second between pings
-
+INTERVAL_MS = 1000
 
 class PingWorkerSignals(QObject):
-    """Signals to communicate ping results back to the main UI thread."""
-    result = pyqtSignal(str, str, object)  # date, time, latency (float or "Timeout")
-
+    result = pyqtSignal(str, str, object)
 
 class PingWorker(QRunnable):
-    """Worker thread tasked with firing the native ping command without freezing the UI."""
     def __init__(self, target):
         super().__init__()
         self.target = target
@@ -45,21 +30,21 @@ class PingWorker(QRunnable):
         now = datetime.now()
         date_str = now.strftime("%Y-%m-%d")
         time_str = now.strftime("%H:%M:%S")
-
         try:
-            flag = "-n" if os.name == "nt" else "-c"
+            # -w 1000 (Windows timeout in ms), -W 1 (Unix timeout in seconds)
+            flag_count = "-n" if os.name == "nt" else "-c"
+            flag_timeout = "-w" if os.name == "nt" else "-W"
+            timeout_val = "1000" if os.name == "nt" else "1"
+
             output = subprocess.check_output(
-                ["ping", flag, "1", self.target],
-                shell=False,
-                text=True,
-                stderr=subprocess.DEVNULL,
+                ["ping", flag_count, "1", flag_timeout, timeout_val, self.target],
+                shell=False, text=True, stderr=subprocess.DEVNULL
             )
             match = re.search(r"time[=<]([\d.]+)\s*ms", output, re.IGNORECASE)
             latency = float(match.group(1)) if match else "Timeout"
         except Exception:
             latency = "Timeout"
 
-        # Append immediately to CSV file
         file_exists = os.path.isfile(CSV_FILE)
         try:
             with open(CSV_FILE, mode="a", newline="", encoding="utf-8") as f:
@@ -68,112 +53,150 @@ class PingWorker(QRunnable):
                     writer.writerow(["date", "time (hh:mm:ss)", "ping"])
                 writer.writerow([date_str, time_str, latency])
         except IOError:
-            pass  # Fail gracefully if file is temporarily locked
+            pass
 
         self.signals.result.emit(date_str, time_str, latency)
 
-
 class LogWindow(QDialog):
-    """Secondary pop-up window containing historical log data that updates dynamically and supports sorting."""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Ping Logs Context")
-        self.resize(550, 450)
-
+        self.resize(650, 480)
+        self.parent_ref = parent
         layout = QVBoxLayout(self)
 
-        # Controls layout (Sorting options)
         controls_layout = QHBoxLayout()
-        lbl_sort = QLabel("Sort by Time:")
-        self.combo_sort = QComboBox()
-        self.combo_sort.addItems(["Chronological (Oldest First)", "Reverse Chronological (Newest First)"])
-        self.combo_sort.currentIndexChanged.connect(self.load_csv_data)
         
+        lbl_sort = QLabel("Sort:")
+        self.combo_sort = QComboBox()
+        self.combo_sort.addItems(["Reverse Chronological (Newest)", "Chronological (Oldest)"])
+        self.combo_sort.currentIndexChanged.connect(self.refresh_table_view)
+
+        lbl_filter = QLabel("Filter:")
+        self.combo_filter = QComboBox()
+        self.combo_filter.addItems([
+            "All Records",
+            "This Session Only",
+            "Today Only",
+            "Last 1 Hour",
+            "Timeouts Only"
+        ])
+        self.combo_filter.currentIndexChanged.connect(self.refresh_table_view)
+
         controls_layout.addWidget(lbl_sort)
         controls_layout.addWidget(self.combo_sort)
+        controls_layout.addSpacing(15)
+        controls_layout.addWidget(lbl_filter)
+        controls_layout.addWidget(self.combo_filter)
         controls_layout.addStretch()
         layout.addLayout(controls_layout)
 
-        # Table setup
         self.table = QTableWidget()
         self.table.setColumnCount(3)
         self.table.setHorizontalHeaderLabels(["Date", "Time (HH:MM:SS)", "Ping (ms)"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         layout.addWidget(self.table)
+        
+        self.refresh_table_view()
 
-        self.load_csv_data()
-
-    def load_csv_data(self):
-        if not os.path.isfile(CSV_FILE):
+    def refresh_table_view(self):
+        if not self.parent_ref:
             return
 
+        records = self.parent_ref.all_records[:]
+        filter_mode = self.combo_filter.currentText()
+        now = datetime.now()
+
+        # Apply filtering
+        if filter_mode == "This Session Only":
+            records = [r for r in records if r["is_session"]]
+        elif filter_mode == "Today Only":
+            today_str = now.strftime("%Y-%m-%d")
+            records = [r for r in records if r["date"] == today_str]
+        elif filter_mode == "Last 1 Hour":
+            cutoff = now - timedelta(hours=1)
+            records = [r for r in records if r["dt"] and r["dt"] >= cutoff]
+        elif filter_mode == "Timeouts Only":
+            records = [r for r in records if r["ping"] == "Timeout"]
+
+        # Apply sorting
+        reverse_order = (self.combo_sort.currentIndex() == 0)
+        records.sort(key=lambda x: x["dt"] if x["dt"] else datetime.min, reverse=reverse_order)
+
+        # Batch rendering to prevent UI stutter on 1000+ rows
+        self.table.setUpdatesEnabled(False)
+        self.table.setRowCount(len(records))
+        for row_idx, r in enumerate(records):
+            item_date = QTableWidgetItem(r["date"])
+            item_time = QTableWidgetItem(r["time"])
+            item_ping = QTableWidgetItem(str(r["ping"]))
+
+            item_date.setTextAlignment(Qt.AlignCenter)
+            item_time.setTextAlignment(Qt.AlignCenter)
+            item_ping.setTextAlignment(Qt.AlignCenter)
+
+            self.table.setItem(row_idx, 0, item_date)
+            self.table.setItem(row_idx, 1, item_time)
+            self.table.setItem(row_idx, 2, item_ping)
+
+        self.table.setUpdatesEnabled(True)
+
+    def append_live_row(self):
+        # Re-render filtered view to maintain sort/filter integrity
+        self.refresh_table_view()
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(f"Live Monitor - Pinging {TARGET_IP}")
+        self.resize(620, 310)
+        self.threadpool = QThreadPool()
+        self.start_dt = datetime.now()
+        self.start_time_str = self.start_dt.strftime("%H:%M:%S")
+        self.log_window = None
+
+        # Data store: list of dicts: {"dt": datetime, "date": str, "time": str, "ping": float|"Timeout", "is_session": bool}
+        self.all_records = []
+        self.load_historical_csv()
+
+        self.init_ui()
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.trigger_ping_worker)
+        self.timer.start(INTERVAL_MS)
+        self.trigger_ping_worker()
+
+    def load_historical_csv(self):
+        if not os.path.isfile(CSV_FILE):
+            return
         try:
             with open(CSV_FILE, mode="r", encoding="utf-8") as f:
                 reader = csv.reader(f)
                 rows = list(reader)
 
-            if not rows or len(rows) <= 1:
+            if len(rows) <= 1:
                 return
 
-            # Safely skip the first row if it matches header definitions
             data_rows = rows[1:] if "date" in rows[0][0].lower() else rows
+            for r in data_rows:
+                if len(r) < 3:
+                    continue
+                date_str, time_str, val_str = r[0].strip(), r[1].strip(), r[2].strip()
+                try:
+                    dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    dt = None
 
-            # FIXED: Explicit element indexing [0] and [1] inside lambda for parsing
-            reverse_order = self.combo_sort.currentIndex() == 1
-            data_rows.sort(key=lambda x: datetime.strptime(f"{x[0]} {x[1]}", "%Y-%m-%d %H:%M:%S"), reverse=reverse_order)
-
-            self.table.setRowCount(len(data_rows))
-            for row_idx, row_data in enumerate(data_rows):
-                for col_idx, value in enumerate(row_data):
-                    item = QTableWidgetItem(value)
-                    item.setTextAlignment(Qt.AlignCenter)
-                    self.table.setItem(row_idx, col_idx, item)
-
-            if not reverse_order:
-                self.table.scrollToBottom()
+                ping_val = float(val_str) if val_str.replace('.', '', 1).isdigit() else "Timeout"
+                self.all_records.append({
+                    "dt": dt,
+                    "date": date_str,
+                    "time": time_str,
+                    "ping": ping_val,
+                    "is_session": False
+                })
         except Exception as e:
-            print(f"Error parsing log file: {e}")
-
-    def append_live_row(self, date_str, time_str, latency):
-        """Dynamically incorporates newly generated metrics directly into the active viewport layout rules."""
-        reverse_order = self.combo_sort.currentIndex() == 1
-
-        if reverse_order:
-            self.table.insertRow(0)
-            target_row = 0
-        else:
-            target_row = self.table.rowCount()
-            self.table.insertRow(target_row)
-
-        self.table.setItem(target_row, 0, QTableWidgetItem(date_str))
-        self.table.setItem(target_row, 1, QTableWidgetItem(time_str))
-        self.table.setItem(target_row, 2, QTableWidgetItem(str(latency)))
-
-        for c in range(3):
-            self.table.item(target_row, c).setTextAlignment(Qt.AlignCenter)
-
-        if not reverse_order:
-            self.table.scrollToBottom()
-
-
-class MainWindow(QMainWindow):
-    """Primary application interface monitoring connection metrics."""
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle(f"Live Monitor - Pinging {TARGET_IP}")
-        self.resize(550, 260)
-
-        self.threadpool = QThreadPool()
-        self.valid_pings = []
-        self.start_time = datetime.now().strftime("%H:%M:%S")
-        self.log_window = None 
-
-        self.init_ui()
-
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.trigger_ping_worker)
-        self.timer.start(INTERVAL_MS)
-        self.trigger_ping_worker()
+            print(f"Error loading historical CSV: {e}")
 
     def init_ui(self):
         toolbar = self.addToolBar("Logs Navigation")
@@ -185,6 +208,29 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
 
+        # Average Calculation Filter Scope
+        filter_bar = QHBoxLayout()
+        lbl_avg_scope = QLabel("Average Calculation Range:")
+        lbl_avg_scope.setStyleSheet("color: #cccccc; font-weight: bold; font-size: 12px;")
+        
+        self.combo_avg_scope = QComboBox()
+        self.combo_avg_scope.addItems([
+            "Session Only (Default)",
+            "All Time (Entire CSV History)",
+            "Last 1 Minute",
+            "Last 5 Minutes",
+            "Last 15 Minutes",
+            "Last 1 Hour",
+            "Today Only"
+        ])
+        self.combo_avg_scope.currentIndexChanged.connect(self.recalculate_average)
+
+        filter_bar.addWidget(lbl_avg_scope)
+        filter_bar.addWidget(self.combo_avg_scope)
+        filter_bar.addStretch()
+        main_layout.addLayout(filter_bar)
+
+        # Metrics Panels
         metrics_layout = QHBoxLayout()
 
         self.left_frame = QFrame()
@@ -213,8 +259,8 @@ class MainWindow(QMainWindow):
         metrics_layout.addWidget(self.right_frame)
         main_layout.addLayout(metrics_layout)
 
-        self.lbl_time_info = QLabel(f"Session Frame Info | Start: {self.start_time}  →  Latest Update: Waiting...")
-        self.lbl_time_info.setStyleSheet("color: #666666; font-size: 11px; margin-top: 5px;")
+        self.lbl_time_info = QLabel(f"Session Frame Info | Start: {self.start_time_str}  →  Latest Update: Waiting...")
+        self.lbl_time_info.setStyleSheet("color: #888888; font-size: 11px; margin-top: 5px;")
         main_layout.addWidget(self.lbl_time_info)
 
     def trigger_ping_worker(self):
@@ -224,36 +270,80 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str, str, object)
     def update_metrics_ui(self, date_str, time_str, latency):
-        self.lbl_time_info.setText(f"Session Frame Info | Start: {self.start_time}  →  Latest Update: {time_str}")
+        now = datetime.now()
+        self.lbl_time_info.setText(f"Session Frame Info | Start: {self.start_time_str}  →  Latest Update: {time_str}")
 
-        if self.log_window and self.log_window.isVisible():
-            self.log_window.append_live_row(date_str, time_str, latency)
+        # Store record in active memory
+        record = {
+            "dt": now,
+            "date": date_str,
+            "time": time_str,
+            "ping": latency,
+            "is_session": True
+        }
+        self.all_records.append(record)
 
+        # Update Current Ping Metric
         if latency == "Timeout":
             self.lbl_current.setText("Timeout")
             self.lbl_current.setStyleSheet("color: #ff3333;")
-            return
+        else:
+            self.lbl_current.setText(f"{latency} ms")
+            self.lbl_current.setStyleSheet(self.get_color_style(latency))
 
-        self.lbl_current.setText(f"{latency} ms")
-        self.valid_pings.append(latency)
+        # Update Average Metric
+        self.recalculate_average()
 
-        avg_latency = sum(self.valid_pings) / len(self.valid_pings)
-        self.lbl_average.setText(f"{avg_latency:.1f} ms")
+        # Update Log Dialog if opened
+        if self.log_window and self.log_window.isVisible():
+            self.log_window.append_live_row()
 
-        def get_color_style(ms_val):
-            if ms_val < 45: return "color: #2ecc71;"
-            elif ms_val <= 120: return "color: #f1c40f;"
-            else: return "color: #e74c3c;"
+    def recalculate_average(self):
+        scope = self.combo_avg_scope.currentText()
+        now = datetime.now()
+        target_pings = []
 
-        self.lbl_current.setStyleSheet(get_color_style(latency))
-        self.lbl_average.setStyleSheet(get_color_style(avg_latency))
+        if scope == "Session Only (Default)":
+            target_pings = [r["ping"] for r in self.all_records if r["is_session"] and isinstance(r["ping"], (int, float))]
+        elif scope == "All Time (Entire CSV History)":
+            target_pings = [r["ping"] for r in self.all_records if isinstance(r["ping"], (int, float))]
+        elif scope == "Today Only":
+            today_str = now.strftime("%Y-%m-%d")
+            target_pings = [r["ping"] for r in self.all_records if r["date"] == today_str and isinstance(r["ping"], (int, float))]
+        elif scope in ["Last 1 Minute", "Last 5 Minutes", "Last 15 Minutes", "Last 1 Hour"]:
+            minutes_map = {
+                "Last 1 Minute": 1,
+                "Last 5 Minutes": 5,
+                "Last 15 Minutes": 15,
+                "Last 1 Hour": 60
+            }
+            cutoff = now - timedelta(minutes=minutes_map[scope])
+            target_pings = [
+                r["ping"] for r in self.all_records
+                if r["dt"] and r["dt"] >= cutoff and isinstance(r["ping"], (int, float))
+            ]
+
+        if target_pings:
+            avg_val = sum(target_pings) / len(target_pings)
+            self.lbl_average.setText(f"{avg_val:.1f} ms")
+            self.lbl_average.setStyleSheet(self.get_color_style(avg_val))
+        else:
+            self.lbl_average.setText("N/A")
+            self.lbl_average.setStyleSheet("color: #888888;")
+
+    def get_color_style(self, ms_val):
+        if ms_val < 45:
+            return "color: #2ecc71;"
+        elif ms_val <= 120:
+            return "color: #f1c40f;"
+        else:
+            return "color: #e74c3c;"
 
     def open_log_window(self):
         if not self.log_window:
             self.log_window = LogWindow(self)
         else:
-            self.log_window.load_csv_data()
-        
+            self.log_window.refresh_table_view()
         self.log_window.show()
         self.log_window.raise_()
         self.log_window.activateWindow()
